@@ -3,6 +3,7 @@ import os
 import hashlib
 import json
 import re
+import shutil
 import sqlite3
 from contextlib import closing
 import uuid
@@ -39,7 +40,7 @@ GROQ_MODEL = os.getenv(
 ).strip()
 
 # Initial tuning value; not a guarantee of medical relevance.
-RAG_SCORE_THRESHOLD = 0.55
+RAG_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.55"))
 RAG_TOP_K = 4
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 MAX_PDF_SIZE = 25 * 1024 * 1024
@@ -110,6 +111,11 @@ def init_chat_db():
         columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
         if "attachment_path" not in columns:
             conn.execute("ALTER TABLE messages ADD COLUMN attachment_path TEXT")
+        conversation_columns = {row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
+        if "pinned" not in conversation_columns:
+            conn.execute("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        if "archived" not in conversation_columns:
+            conn.execute("ALTER TABLE conversations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id)")
         conn.commit()
 
@@ -127,12 +133,35 @@ def create_conversation(title="New conversation"):
 
 
 def list_conversations(limit=40):
+    """Active (not archived) chats: pinned first, then most recently updated."""
     with closing(db_connect()) as conn:
         rows = conn.execute(
-            "SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT ?",
+            "SELECT id, title, created_at, updated_at, pinned FROM conversations "
+            "WHERE archived = 0 ORDER BY pinned DESC, updated_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def list_archived_conversations(limit=100):
+    with closing(db_connect()) as conn:
+        rows = conn.execute(
+            "SELECT id, title, created_at, updated_at FROM conversations "
+            "WHERE archived = 1 ORDER BY updated_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def set_chat_flag(conversation_id, column, value):
+    if column not in ("pinned", "archived"):
+        raise ValueError("Unsupported chat flag")
+    with closing(db_connect()) as conn:
+        conn.execute(
+            f"UPDATE conversations SET {column} = ? WHERE id = ?",
+            (1 if value else 0, conversation_id),
+        )
+        conn.commit()
 
 
 def get_conversation(conversation_id):
@@ -206,10 +235,38 @@ def update_conversation_image(conversation_id, image_context, image_filename):
         conn.commit()
 
 
+def rename_conversation(conversation_id, new_title):
+    title = " ".join(str(new_title or "").split())[:80]
+    if not title:
+        return False
+    with closing(db_connect()) as conn:
+        conn.execute(
+            "UPDATE conversations SET title = ? WHERE id = ?",
+            (title, conversation_id),
+        )
+        conn.commit()
+    return True
+
+
 def delete_conversation(conversation_id):
     with closing(db_connect()) as conn:
         conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         conn.commit()
+
+
+def truncate_conversation_from(conversation_id, index):
+    """Delete the message at position `index` (0-based) and every message after it."""
+    with closing(db_connect()) as conn:
+        row = conn.execute(
+            "SELECT id FROM messages WHERE conversation_id = ? ORDER BY id LIMIT 1 OFFSET ?",
+            (conversation_id, index),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "DELETE FROM messages WHERE conversation_id = ? AND id >= ?",
+                (conversation_id, row["id"]),
+            )
+            conn.commit()
 
 
 def should_show_document_status(question):
@@ -222,6 +279,74 @@ def should_show_document_status(question):
         "according to", "source", "citation", "what does the document", "in the pdf",
     )
     return any(word in text for word in keywords)
+
+
+def open_chat(chat_id):
+    selected = get_conversation(chat_id) or {}
+    st.session_state.conversation_id = chat_id
+    st.session_state.messages = load_conversation_messages(chat_id)
+    st.session_state.image_context = selected.get("image_context")
+    st.session_state.image_filename = selected.get("image_filename")
+    st.session_state.analyzed_image_id = None
+    st.session_state.last_rag_warning = None
+    st.session_state.editing_index = None
+
+
+def leave_chat_if_active(chat_id):
+    """After a chat is deleted or archived, move to the newest remaining chat."""
+    if chat_id != st.session_state.get("conversation_id"):
+        return
+    remaining = list_conversations(limit=1)
+    open_chat(remaining[0]["id"] if remaining else create_conversation())
+
+
+def remove_chat(chat_id):
+    delete_conversation(chat_id)
+    upload_dir = DATA_DIR / "chat_uploads" / chat_id
+    if upload_dir.is_dir():
+        shutil.rmtree(upload_dir, ignore_errors=True)
+    leave_chat_if_active(chat_id)
+
+
+@st.dialog("Rename chat")
+def rename_dialog(chat_id, current_title):
+    new_title = st.text_input("Chat name", value=current_title, max_chars=80)
+    if st.button("Save name", key="rename_save_btn", type="primary", use_container_width=True):
+        if rename_conversation(chat_id, new_title):
+            st.rerun()
+        else:
+            st.warning("Enter a name first.")
+
+
+@st.dialog("Delete chat?")
+def delete_dialog(chat_id, title):
+    st.write(f"“{title}” and its messages will be removed from this server. This cannot be undone.")
+    cancel_col, delete_col = st.columns(2)
+    with cancel_col:
+        if st.button("Cancel", key="cancel_delete_btn", use_container_width=True):
+            st.rerun()
+    with delete_col:
+        if st.button("Delete", key="confirm_delete_btn", type="primary", use_container_width=True):
+            remove_chat(chat_id)
+            st.rerun()
+
+
+def save_medical_pdf(filename, payload):
+    """Validate and save a PDF into the medical library. Returns an error text or None."""
+    safe_name = Path(filename or "").name
+    if not safe_name.lower().endswith(".pdf"):
+        return f"{safe_name}: file extension is not PDF"
+    if not payload:
+        return f"{safe_name}: empty file"
+    if len(payload) > MAX_PDF_SIZE:
+        return f"{safe_name}: exceeds 25 MB"
+    if not payload.startswith(b"%PDF-"):
+        return f"{safe_name}: invalid PDF signature"
+    try:
+        (MEDICAL_PDF_DIR / safe_name).write_bytes(payload)
+    except OSError as exc:
+        return f"{safe_name}: could not save ({exc})"
+    return None
 
 
 init_chat_db()
@@ -249,6 +374,7 @@ for key, default_value in {
     "image_filename": None,
     "analyzed_image_id": None,
     "last_rag_warning": None,
+    "editing_index": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default_value
@@ -260,148 +386,148 @@ for key, default_value in {
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
     :root {
-      --hc-ink: #10213b;
-      --hc-muted: #61718b;
-      --hc-teal: #087f78;
-      --hc-teal-dark: #064e52;
-      --hc-mint: #d9faf2;
-      --hc-line: #e2eaf0;
-      --hc-surface: #ffffff;
-      --hc-bg: #f7fafc;
-      --hc-sidebar: #063f46;
-    }
-    html, body, [class*="css"], .stApp { font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
-    .stApp { background: var(--hc-bg); color: var(--hc-ink); }
-    [data-testid="stHeader"] { background: rgba(255,255,255,.94); }
-    .block-container { max-width: 1480px; padding: 1.2rem 1.5rem 7rem; }
-    h1, h2, h3, h4 { color: var(--hc-ink) !important; font-family: 'Manrope', 'DM Sans', sans-serif !important; letter-spacing: -.035em; }
-    .stMarkdown, .stMarkdown p, .stMarkdown li { color: #30343b; font-size: .97rem; line-height: 1.72; }
-    [data-testid="stCaptionContainer"] { color: var(--hc-muted); font-size: .78rem; }
-    .hero { background: linear-gradient(120deg, #ffffff 0%, #f0fdfa 78%, #e8f7ff 100%); border: 1px solid #dceeea; border-radius: 22px; padding: 22px 28px; margin: 0 0 14px; color: var(--hc-ink); box-shadow: 0 8px 30px rgba(12,74,80,.045); position: relative; overflow: hidden; }
-    .hero:after { content: ""; position:absolute; width:190px; height:190px; right:-65px; top:-90px; border:1px solid rgba(15,118,110,.12); border-radius:50%; box-shadow:0 0 0 28px rgba(15,118,110,.035),0 0 0 58px rgba(15,118,110,.025); }
-    .hero .eyebrow { color:#0f766e; text-transform:uppercase; letter-spacing:.13em; font-size:.7rem; font-weight:750; margin-bottom:8px; }
-    .hero h1 { color:#172b2a !important; font-size:clamp(1.8rem,3.5vw,2.35rem); line-height:1.15; margin:0 0 8px; }
-    .hero p { color:#59666a !important; max-width:680px; line-height:1.6; margin:0; font-size:.96rem; }
-    .notice { display:flex; gap:10px; align-items:flex-start; background:#fffbeb; border:1px solid #f4e4b4; border-left:3px solid #d97706; border-radius:12px; padding:11px 14px; margin:14px 0 20px; color:#784f13; font-size:.86rem; line-height:1.55; }
-    .notice strong { color:#713f12; }
-    [data-testid="stSidebar"] { background:linear-gradient(180deg,#063f46 0%,#032f38 100%); border-right:1px solid #0b4d54; }
-    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p, [data-testid="stSidebar"] label { color:#d8eeee !important; }
-    .sidebar-brand { display:flex; align-items:center; gap:11px; padding:8px 4px 18px; margin-bottom:10px; border-bottom:1px solid rgba(190,245,237,.16); }
-    .brand-mark { display:flex; align-items:center; justify-content:center; width:42px; height:42px; border-radius:14px; background:#9af1df; color:#064e4a; font-size:28px; font-weight:800; box-shadow:0 5px 16px rgba(0,0,0,.12); }
-    .brand-title { color:#f4fffd; font:800 1.12rem Manrope, sans-serif; letter-spacing:-.03em; }
-    .brand-subtitle { color:#b8d9d8; font-size:.72rem; margin-top:2px; }
-    [data-testid="stSidebar"] > div:first-child { padding-top:1rem; }
-    [data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3 { color:#f1fffd !important; font-family:'Manrope','DM Sans',sans-serif !important; }
-    [data-testid="stSidebar"] p,[data-testid="stSidebar"] label { color:#d8eeee; }
-    [data-testid="stSidebar"] div[data-testid="stButton"] > button { text-align:left; justify-content:flex-start; background:rgba(255,255,255,.045); border:1px solid rgba(220,250,246,.12); color:#e7f7f5; min-height:2.45rem; padding:.5rem .72rem; font-weight:600; border-radius:12px; }
-    [data-testid="stSidebar"] div[data-testid="stButton"] > button:hover { background:#b8f5e8; border-color:#b8f5e8; color:#064e4a; }
-    div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button { border-radius:10px; min-height:2.45rem; font-weight:600; border:1px solid #e1e4e8; transition:all .14s ease; box-shadow:none; }
-    div[data-testid="stButton"] > button[kind="primary"] { background:#0f9488; border-color:#0f9488; color:#fff; }
-    div[data-testid="stButton"] > button[kind="primary"]:hover { background:#115e59; border-color:#115e59; }
-    div[data-testid="stButton"] > button:hover, div[data-testid="stDownloadButton"] > button:hover { border-color:#a7cfc9; color:#115e59; }
-    [data-testid="stChatMessage"] { background:transparent; border:0; border-radius:0; padding:.8rem .25rem; box-shadow:none; margin-bottom:.7rem; border-bottom:1px solid #f0f1f2; }
-    [data-testid="stChatMessage"] p { line-height:1.78; color:#292d32; }
-    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] { max-width:100%; }
-    [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) { background:#e7f5f6; border:1px solid #d5ebee; border-radius:18px; padding:.85rem 1rem; margin:.55rem 0 .9rem auto; max-width:92%; }
-    [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) { background:rgba(255,255,255,.86); border:1px solid #e5edf1; border-radius:18px; padding:.95rem 1.05rem; box-shadow:0 4px 16px rgba(25,54,76,.035); }
-    [data-testid="stChatInput"] { border-radius:22px; border:1px solid #d7e3e8; box-shadow:0 7px 25px rgba(15,45,65,.07); background:#fff; }
-    [data-testid="stChatInput"] textarea { color:#202123 !important; -webkit-text-fill-color:#202123 !important; caret-color:#0f766e !important; font-family:'DM Sans',sans-serif !important; }
-    [data-testid="stChatInput"] textarea::placeholder { color:#898d96 !important; -webkit-text-fill-color:#898d96 !important; }
-    [data-testid="stExpander"] { background:#fff; border:1px solid #e1e9ed; border-radius:14px; overflow:hidden; box-shadow:0 4px 14px rgba(9,53,67,.035); }
-    [data-testid="stSidebar"] [data-testid="stExpander"] { background:linear-gradient(135deg,rgba(148,245,224,.14),rgba(255,255,255,.055)); border:1px solid rgba(157,246,229,.38); border-left:4px solid #72e7d0; border-radius:14px; box-shadow:0 5px 16px rgba(0,0,0,.08); margin:7px 0; transition:all .15s ease; }
-    [data-testid="stSidebar"] [data-testid="stExpander"]:hover { background:linear-gradient(135deg,rgba(148,245,224,.21),rgba(255,255,255,.08)); border-color:rgba(157,246,229,.58); }
-    [data-testid="stSidebar"] [data-testid="stExpander"] summary { color:#f1fffd !important; font-weight:750; min-height:3rem; padding:.35rem .2rem; }
-    [data-testid="stSidebar"] [data-testid="stExpander"] summary:hover { color:#a8ffec !important; }
-    [data-testid="stSidebar"] [data-testid="stExpander"] summary svg { color:#8ef2df !important; }
-    [data-testid="stSidebar"] [data-testid="stFileUploader"] section { background:rgba(255,255,255,.08); border:1px dashed rgba(190,245,237,.5); border-radius:12px; }
-    [data-testid="stSidebar"] [data-testid="stButton"] > button[kind="primary"] { background:linear-gradient(110deg,#9cf5e4,#c9fff2); border-color:#a4f3e4; color:#063f46; box-shadow:0 5px 18px rgba(0,0,0,.08); }
-    [data-testid="stSidebar"] [data-testid="stButton"] > button[kind="primary"]:hover { background:#b5ffef; color:#063f46; }
-    [data-testid="stFileUploader"] section { background:#fbfcfc; border:1px dashed #b7cbc8; border-radius:12px; }
-    [data-testid="stAlert"] { border-radius:12px; }
-    hr { border-color:#e9eaec; }
-    .small-label { color:#0f766e; text-transform:uppercase; font-size:.68rem; font-weight:750; letter-spacing:.12em; }
-    .feature-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:14px 0 22px; }
-    .feature-card { display:flex; align-items:center; gap:12px; min-height:94px; padding:15px; border-radius:17px; border:1px solid #e1ecef; background:rgba(255,255,255,.92); box-shadow:0 5px 18px rgba(10,59,71,.04); }
-    .feature-icon { flex:0 0 46px; width:46px; height:46px; display:flex; align-items:center; justify-content:center; border-radius:14px; font-size:25px; font-weight:700; }
-    .feature-icon.mint { background:#c9fbef; color:#087f75; } .feature-icon.aqua { background:#d9f8f4; color:#087f75; } .feature-icon.blue { background:#dceeff; color:#1763a6; }
-    .feature-title { color:#10213f; font-weight:750; font-size:.98rem; margin-bottom:3px; } .feature-copy { color:#607186; font-size:.78rem; line-height:1.4; } .feature-arrow { color:#0f766e; margin-left:auto; font-size:1.3rem; }
-    /* Accessible contrast overrides for Streamlit widgets and mixed theme states */
-    .stApp, .stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stText"] { color:#172033; }
-    .stApp input, .stApp textarea, .stApp [role="combobox"], .stApp [data-baseweb="select"] *, .stApp [data-baseweb="input"] * { color:#172033 !important; -webkit-text-fill-color:#172033; }
-    .stApp input::placeholder, .stApp textarea::placeholder { color:#68758a !important; -webkit-text-fill-color:#68758a !important; opacity:1; }
-    .stApp [data-testid="stFileUploader"] label, .stApp [data-testid="stFileUploader"] small { color:#34445b !important; }
-    .stApp [data-testid="stExpander"] summary, .stApp [data-testid="stExpander"] summary p { color:#18313b !important; }
-    .stApp [data-testid="stAlert"] p, .stApp [data-testid="stAlert"] li { color:#263446 !important; }
-    .stApp [data-testid="stCaptionContainer"] p { color:#526176 !important; }
-    .stApp [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p, .stApp [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] li, .stApp [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] strong { color:#202b3b !important; }
-    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p, [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] li, [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { color:#e2f0f0 !important; }
-    [data-testid="stSidebar"] input, [data-testid="stSidebar"] textarea, [data-testid="stSidebar"] [data-baseweb="select"] *, [data-testid="stSidebar"] [data-baseweb="input"] * { color:#172033 !important; -webkit-text-fill-color:#172033 !important; }
-    [data-testid="stSidebar"] [data-testid="stExpander"] [data-testid="stMarkdownContainer"] p, [data-testid="stSidebar"] [data-testid="stExpander"] [data-testid="stCaptionContainer"] p { color:#e4f4f2 !important; }
-    .evidence-card { border:1px solid #cfe6df; border-left:4px solid #0f766e; border-radius:13px; padding:12px 15px; background:#f0faf7; color:#183b38; margin:10px 0 14px; }
-    .evidence-card strong { color:#124e48; }
-    .evidence-meta { color:#3f5f5b; font-size:.83rem; line-height:1.55; }
-
-    /* Final accessible contrast pass: light surfaces use dark text; dark surfaces use white text. */
-    /* Main canvas and cards */
-    .stApp, .stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stText"] { color:#111827; }
-    .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6 { color:#111827 !important; }
-    .stApp p, .stApp li, .stApp label, .stApp small { color:#1f2937; }
-    .stApp [data-testid="stChatMessage"] p, .stApp [data-testid="stChatMessage"] li,
-    .stApp [data-testid="stChatMessage"] strong, .stApp [data-testid="stChatMessage"] em { color:#111827 !important; }
-
-    /* Dark teal sidebar: all default text and controls remain bright and readable. */
-    [data-testid="stSidebar"], [data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
-    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
-    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] li,
-    [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
-    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p,
-    [data-testid="stSidebar"] label,
-    [data-testid="stSidebar"] [data-testid="stExpander"] summary,
-    [data-testid="stSidebar"] [data-testid="stExpander"] summary p { color:#F8FAFC !important; }
-    [data-testid="stSidebar"] [data-testid="stButton"] > button:not([kind="primary"]),
-    [data-testid="stSidebar"] [data-testid="stDownloadButton"] > button {
-      background:#123F46 !important; border-color:#397078 !important; color:#FFFFFF !important;
-    }
-    [data-testid="stSidebar"] [data-testid="stButton"] > button:not([kind="primary"]) *,
-    [data-testid="stSidebar"] [data-testid="stDownloadButton"] > button * { color:#FFFFFF !important; -webkit-text-fill-color:#FFFFFF !important; }
-    /* Mint primary sidebar button is a light surface, so use dark text for contrast. */
-    [data-testid="stSidebar"] [data-testid="stButton"] > button[kind="primary"],
-    [data-testid="stSidebar"] [data-testid="stButton"] > button[kind="primary"] * { background:#A7F3E4 !important; color:#063F46 !important; -webkit-text-fill-color:#063F46 !important; }
-    [data-testid="stSidebar"] [data-testid="stExpander"] [data-testid="stMarkdownContainer"] p,
-    [data-testid="stSidebar"] [data-testid="stExpander"] [data-testid="stCaptionContainer"] p { color:#F8FAFC !important; }
-    [data-testid="stSidebar"] [data-testid="stFileUploader"] section,
-    [data-testid="stSidebar"] [data-testid="stFileUploader"] section * { color:#FFFFFF !important; }
-    [data-testid="stSidebar"] input, [data-testid="stSidebar"] textarea,
-    [data-testid="stSidebar"] [data-baseweb="select"] *, [data-testid="stSidebar"] [data-baseweb="input"] * {
-      background:#FFFFFF !important; color:#111827 !important; -webkit-text-fill-color:#111827 !important;
+      --ink: #0B2B2E;
+      --ink-2: #2E4A4D;
+      --muted: #5A7073;
+      --bg: #FFFFFF;
+      --soft: #F2F8F7;
+      --line: #DCE8E6;
+      --green: #0A8F7F;
+      --green-dark: #077164;
+      --tint: #E3F5F2;
+      --warn-bg: #FFF8E8;
+      --warn-line: #F0D9A0;
+      --warn-ink: #5C430C;
     }
 
-    /* Main area buttons: dark fills always get white text; pale buttons get dark text. */
-    .stApp div[data-testid="stButton"] > button[kind="primary"],
-    .stApp div[data-testid="stButton"] > button[kind="primary"] *,
-    .stApp div[data-testid="stDownloadButton"] > button[kind="primary"] * {
-      background:#087F78 !important; border-color:#087F78 !important; color:#FFFFFF !important; -webkit-text-fill-color:#FFFFFF !important;
+    /* Base */
+    html, body, .stApp, [class*="css"] { font-family: 'Plus Jakarta Sans', system-ui, -apple-system, 'Segoe UI', sans-serif; }
+    .stApp { background: linear-gradient(180deg, #EAF7F4 0%, #FFFFFF 340px); background-attachment: fixed; color: var(--ink); }
+    [data-testid="stHeader"] { background: transparent; }
+    .block-container { max-width: 860px; padding: 4.2rem 1.4rem 9rem; }
+    h1, h2, h3, h4 { font-family: 'Plus Jakarta Sans', sans-serif !important; color: var(--ink) !important; letter-spacing: -.02em; font-weight: 700 !important; }
+    .stApp [data-testid="stMarkdownContainer"] p, .stApp [data-testid="stMarkdownContainer"] li { color: var(--ink-2); font-size: 1rem; line-height: 1.7; }
+    .stApp [data-testid="stCaptionContainer"] p { color: var(--muted) !important; font-size: .82rem; }
+    hr { border-color: var(--line); }
+    :focus-visible { outline: 2px solid var(--green) !important; outline-offset: 2px; }
+
+    /* Welcome */
+    .hc-welcome { text-align: center; padding: 2.2rem 0 1.2rem; }
+    .hc-badge { display: inline-flex; align-items: center; justify-content: center; width: 56px; height: 56px; border-radius: 16px; background: var(--green); color: #FFFFFF; font-size: 34px; font-weight: 700; margin-bottom: 1.1rem; box-shadow: 0 8px 22px rgba(10,143,127,.28); }
+    .hc-welcome h1 { font-size: clamp(1.9rem, 4.4vw, 2.6rem); line-height: 1.15; margin: 0 0 .6rem; }
+    .hc-welcome p { color: var(--muted) !important; max-width: 52ch; margin: 0 auto 1.1rem; font-size: 1.02rem; }
+    .hc-trust { display: flex; flex-wrap: wrap; justify-content: center; gap: .5rem 1.3rem; margin: 0 0 1.6rem; }
+    .hc-trust span { display: inline-flex; align-items: center; gap: .4rem; font-size: .86rem; font-weight: 600; color: var(--ink-2); }
+    .hc-trust svg { width: 16px; height: 16px; stroke: var(--green); fill: none; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+
+    /* Suggestion chips */
+    .st-key-chips div[data-testid="stButton"] > button { min-height: 3.1rem; border-radius: 14px; background: #FFFFFF !important; border: 1px solid var(--line); text-align: left; justify-content: flex-start; padding: .6rem 1rem; box-shadow: 0 1px 2px rgba(11,43,46,.04); }
+    .st-key-chips div[data-testid="stButton"] > button:hover { border-color: var(--green); background: var(--tint) !important; }
+    .st-key-chips div[data-testid="stButton"] > button p { font-weight: 600; font-size: .95rem; }
+
+    /* Disclaimer */
+    .hc-note { display: flex; gap: .6rem; align-items: flex-start; background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 12px; padding: .7rem .95rem; margin: 0 0 1rem; color: var(--warn-ink); font-size: .88rem; line-height: 1.5; }
+    .hc-note strong { color: var(--warn-ink); }
+
+    /* Sidebar */
+    [data-testid="stSidebar"] { background: var(--soft); border-right: 1px solid var(--line); }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p, [data-testid="stSidebar"] label { color: var(--ink-2) !important; }
+    [data-testid="stSidebar"] h3 { font-size: .8rem !important; font-weight: 700 !important; color: var(--muted) !important; margin: .4rem 0 .2rem; }
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { color: var(--muted) !important; }
+    .sidebar-brand { display: flex; align-items: center; gap: 11px; padding: 4px 2px 14px; margin-bottom: 8px; border-bottom: 1px solid var(--line); }
+    .brand-mark { display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; border-radius: 11px; background: var(--green); color: #FFFFFF; font-size: 24px; font-weight: 700; }
+    .brand-title { color: var(--ink); font-weight: 800; font-size: 1.05rem; letter-spacing: -.02em; }
+    .brand-subtitle { color: var(--muted); font-size: .74rem; margin-top: 1px; }
+
+    /* Buttons */
+    div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button { border-radius: 12px; min-height: 2.5rem; font-weight: 600; border: 1px solid var(--line); background: #FFFFFF !important; box-shadow: none; transition: border-color .14s ease, background .14s ease; }
+    div[data-testid="stButton"] > button *, div[data-testid="stDownloadButton"] > button * { color: var(--ink) !important; -webkit-text-fill-color: var(--ink) !important; }
+    div[data-testid="stButton"] > button:hover, div[data-testid="stDownloadButton"] > button:hover { border-color: var(--green); background: var(--tint) !important; }
+    div[data-testid="stButton"] > button[kind="primary"] { background: var(--green) !important; border-color: var(--green) !important; }
+    div[data-testid="stButton"] > button[kind="primary"] * { color: #FFFFFF !important; -webkit-text-fill-color: #FFFFFF !important; }
+    div[data-testid="stButton"] > button[kind="primary"]:hover { background: var(--green-dark) !important; border-color: var(--green-dark) !important; }
+    [data-testid="stSidebar"] div[data-testid="stButton"] > button, [data-testid="stSidebar"] div[data-testid="stDownloadButton"] > button { justify-content: flex-start; text-align: left; }
+    [data-testid="stSidebar"] div[data-testid="stButton"] > button > div, [data-testid="stSidebar"] div[data-testid="stButton"] > button p { justify-content: flex-start !important; text-align: left !important; width: 100%; }
+    [data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="primary"] > div { justify-content: center !important; text-align: center !important; }
+    [data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="secondary"] { background: transparent !important; border-color: transparent; }
+    [data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="secondary"]:hover { background: #FFFFFF !important; border-color: var(--line); }
+
+    /* Sidebar collapse control */
+    [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] { opacity: 1 !important; visibility: visible !important; }
+    [data-testid="stSidebarCollapseButton"] button, [data-testid="stSidebarCollapsedControl"] button, [data-testid="collapsedControl"] button { background: #FFFFFF !important; border: 1px solid var(--line) !important; border-radius: 10px !important; opacity: 1 !important; }
+    [data-testid="stSidebarCollapseButton"] button *, [data-testid="stSidebarCollapsedControl"] button *, [data-testid="collapsedControl"] button * { color: var(--ink) !important; fill: var(--ink) !important; -webkit-text-fill-color: var(--ink) !important; opacity: 1 !important; }
+
+    /* Chat */
+    [data-testid="stChatMessage"] { border-radius: 16px; padding: .85rem 1rem; margin: .5rem 0 .8rem; }
+    [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) { background: var(--tint); border: 1px solid #C5E8E2; }
+    [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) { background: #FFFFFF; border: 1px solid var(--line); box-shadow: 0 2px 10px rgba(11,43,46,.04); }
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p,
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] li,
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] strong { color: var(--ink) !important; line-height: 1.72; }
+
+    [data-testid="stChatInput"] { background: #FFFFFF !important; border: 1px solid #B8D3CE; border-radius: 18px; box-shadow: 0 6px 24px rgba(11,43,46,.08); }
+    [data-testid="stChatInput"]:focus-within { border-color: var(--green); }
+    [data-testid="stChatInput"] > div { background: #FFFFFF !important; }
+    [data-testid="stChatInput"] textarea { background: #FFFFFF !important; color: var(--ink) !important; -webkit-text-fill-color: var(--ink) !important; caret-color: var(--green) !important; font-family: 'Plus Jakarta Sans', sans-serif !important; }
+    [data-testid="stChatInput"] textarea::placeholder { color: #6A8083 !important; -webkit-text-fill-color: #6A8083 !important; opacity: 1 !important; }
+
+    /* Panels, uploads, alerts */
+    [data-testid="stExpander"] { background: #FFFFFF; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; box-shadow: none; }
+    .stApp [data-testid="stExpander"] summary, .stApp [data-testid="stExpander"] summary p { color: var(--ink) !important; font-weight: 600; }
+    [data-testid="stFileUploader"] section { background: #FFFFFF; border: 1px dashed #9CC2BB; border-radius: 12px; }
+    [data-testid="stFileUploader"] section *, [data-testid="stFileUploader"] label, [data-testid="stFileUploader"] small { color: var(--ink-2) !important; }
+    [data-testid="stAlert"] { border-radius: 12px; }
+    .stApp [data-testid="stAlert"] p, .stApp [data-testid="stAlert"] li { color: var(--ink) !important; }
+    .stApp input, .stApp textarea, .stApp [data-baseweb="select"] * { color: var(--ink) !important; -webkit-text-fill-color: var(--ink) !important; }
+
+    /* Chat row menu: three dots appear on hover, no box (always visible on touch screens) */
+    [class*="st-key-chatrow_"] [data-testid="stPopover"] button { opacity: 0; width: 100%; min-height: 2rem; padding: 0; background: transparent !important; border: 0 !important; box-shadow: none !important; border-radius: 8px; transition: opacity .12s ease, background .12s ease; }
+    [class*="st-key-chatrow_"] [data-testid="stPopover"] button svg, [class*="st-key-chatrow_"] [data-testid="stPopover"] button [data-testid="stIconMaterial"] { display: none; }
+    [class*="st-key-chatrow_"] [data-testid="stPopover"] button > div { justify-content: center; }
+    [class*="st-key-chatrow_"] [data-testid="stPopover"] button, [class*="st-key-chatrow_"] [data-testid="stPopover"] button * { white-space: nowrap !important; word-break: keep-all !important; }
+    [class*="st-key-chatrow_"] [data-testid="stPopover"] button p { font-size: .7rem; letter-spacing: .1em; line-height: 1; margin: 0; padding: 0; text-align: center; color: var(--ink-2) !important; -webkit-text-fill-color: var(--ink-2) !important; }
+    [class*="st-key-chatrow_"]:hover [data-testid="stPopover"] button,
+    [class*="st-key-chatrow_"]:focus-within [data-testid="stPopover"] button,
+    [class*="st-key-chatrow_"] [data-testid="stPopover"] button[aria-expanded="true"] { opacity: 1; }
+    [class*="st-key-chatrow_"] [data-testid="stPopover"] button:hover, [class*="st-key-chatrow_"] [data-testid="stPopover"] button[aria-expanded="true"] { background: #DDEAE7 !important; }
+    @media (hover: none) { [class*="st-key-chatrow_"] [data-testid="stPopover"] button { opacity: 1; } }
+
+    /* Chat list: one line per chat with ellipsis, active chat highlighted */
+    [class*="st-key-chatrow_"] [data-testid="stHorizontalBlock"] { gap: .15rem; align-items: center; flex-wrap: nowrap; }
+    [class*="st-key-chatrow_"] [data-testid="stColumn"]:last-child { min-width: 2.2rem; flex: 0 0 2.2rem; width: 2.2rem; }
+    [class*="st-key-history_chat_"] button { min-height: 2.3rem; }
+    [class*="st-key-history_chat_"] button p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; font-weight: 500; }
+    [class*="st-key-chatrow_on_"] [class*="st-key-history_chat_"] button { background: #DDEBE8 !important; border-color: transparent !important; }
+    [class*="st-key-chatrow_on_"] [class*="st-key-history_chat_"] button p { font-weight: 700; }
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: .45rem; }
+    [data-testid="stSidebar"] [class*="st-key-chatrow_"] { margin-bottom: -.15rem; }
+
+    /* Edit button under user messages: appears on hover (always visible on touch) */
+    [class*="st-key-editrow_"] button { opacity: 0; min-height: 1.9rem; padding: 0 .55rem; border: 0 !important; background: transparent !important; box-shadow: none; transition: opacity .12s ease, background .12s ease; }
+    [class*="st-key-editrow_"] button * { color: var(--muted) !important; -webkit-text-fill-color: var(--muted) !important; font-size: .82rem; }
+    [data-testid="stChatMessage"]:hover [class*="st-key-editrow_"] button, [class*="st-key-editrow_"] button:focus-visible { opacity: 1; }
+    [class*="st-key-editrow_"] button:hover { background: #DDEAE7 !important; }
+    @media (hover: none) { [class*="st-key-editrow_"] button { opacity: 1; } }
+
+    /* Menu card, ChatGPT style: white, rounded, soft shadow, icon + label rows */
+    [data-testid="stPopoverBody"] { min-width: 210px; background: #FFFFFF; border: 1px solid var(--line); border-radius: 14px; padding: .35rem; box-shadow: 0 12px 32px rgba(11,43,46,.16); }
+    [data-testid="stPopoverBody"] [data-testid="stVerticalBlock"] { gap: .1rem; }
+    [data-testid="stPopoverBody"] div[data-testid="stButton"] > button { min-height: 2.4rem; padding: 0 .7rem; border: 0 !important; border-radius: 9px; background: transparent !important; box-shadow: none; justify-content: flex-start; text-align: left; }
+    [data-testid="stPopoverBody"] div[data-testid="stButton"] > button:hover { background: #F1F6F5 !important; }
+    [data-testid="stPopoverBody"] div[data-testid="stButton"] > button > div { justify-content: flex-start !important; gap: .65rem; width: 100%; }
+    [data-testid="stPopoverBody"] div[data-testid="stButton"] > button p { font-size: .93rem; font-weight: 500; text-align: left !important; }
+    [data-testid="stPopoverBody"] div[data-testid="stButton"] > button [data-testid="stIconMaterial"] { font-size: 1.25rem; color: var(--ink-2) !important; -webkit-text-fill-color: var(--ink-2) !important; }
+    [class*="st-key-del_"] { border-top: 1px solid var(--line); margin-top: .25rem; padding-top: .25rem; }
+    [class*="st-key-del_"] button p, [class*="st-key-del_"] button [data-testid="stIconMaterial"] { color: #B42318 !important; -webkit-text-fill-color: #B42318 !important; }
+    .st-key-confirm_delete_btn button { background: #B42318 !important; border-color: #B42318 !important; }
+    .st-key-confirm_delete_btn button:hover { background: #8F1B12 !important; border-color: #8F1B12 !important; }
+
+    @media (max-width: 768px) {
+      .block-container { padding: 3.8rem .9rem 8rem; }
+      .hc-welcome { padding-top: 1rem; }
     }
-    .stApp div[data-testid="stButton"] > button:not([kind="primary"]),
-    .stApp div[data-testid="stDownloadButton"] > button { background:#FFFFFF !important; color:#111827 !important; }
-    .stApp div[data-testid="stButton"] > button:not([kind="primary"]) *,
-    .stApp div[data-testid="stDownloadButton"] > button * { color:#111827 !important; -webkit-text-fill-color:#111827 !important; }
-
-    /* Chat composer is a white surface: typed text black, placeholder medium grey. */
-    [data-testid="stChatInput"], [data-testid="stChatInput"] > div { background:#FFFFFF !important; }
-    [data-testid="stChatInput"] textarea,
-    [data-testid="stChatInput"] textarea:focus { background:#FFFFFF !important; color:#111827 !important; -webkit-text-fill-color:#111827 !important; caret-color:#087F78 !important; }
-    [data-testid="stChatInput"] textarea::placeholder { color:#6B7280 !important; -webkit-text-fill-color:#6B7280 !important; opacity:1 !important; }
-    [data-testid="stChatInput"] button { color:#FFFFFF !important; }
-
-    /* Keep expandable panels readable in both light main area and dark sidebar. */
-    .stApp [data-testid="stExpander"]:not([data-testid="stSidebar"] *) { background:#FFFFFF; }
-    .stApp [data-testid="stExpander"] summary, .stApp [data-testid="stExpander"] summary p { color:#111827 !important; }
-    .stApp [data-testid="stAlert"] p, .stApp [data-testid="stAlert"] li { color:#111827 !important; }
-    .stApp [data-testid="stCaptionContainer"] p { color:#4B5563 !important; }
-    @media (max-width:768px) { .block-container { padding:.8rem .8rem 6rem; } .hero { padding:20px 18px; border-radius:16px; } .hero p { font-size:.9rem; } .feature-grid { grid-template-columns:1fr; } .feature-card { min-height:76px; } [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) { max-width:100%; } }
     </style>
     """,
     unsafe_allow_html=True,
@@ -413,31 +539,43 @@ st.markdown(
 
 st.markdown(
     """
-    <div class="hero">
-        <div class="eyebrow">Your health information workspace</div>
-        <h1>HealthCare AI</h1>
-        <p>Ask health questions, explore trusted medical documents, and understand image content — all in one place.</p>
+    <div class="hc-note">
+      <span><strong>For information only.</strong> Answers are not a diagnosis and do not replace a doctor. In an emergency, get urgent care now (India: call 112).</span>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown(
-    """
-    <div class="notice">
-        <strong>For information only.</strong> AI responses are not a diagnosis and do not replace a qualified clinician. For emergencies, seek urgent medical care.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.markdown("""
-<div class="feature-grid">
-  <div class="feature-card"><div class="feature-icon mint">✦</div><div><div class="feature-title">AI Chat</div><div class="feature-copy">Ask health questions and explore trusted information.</div></div><span class="feature-arrow">↗</span></div>
-  <div class="feature-card"><div class="feature-icon aqua">▤</div><div><div class="feature-title">Medical Library</div><div class="feature-copy">Upload PDFs and search your medical knowledge base.</div></div><span class="feature-arrow">↗</span></div>
-  <div class="feature-card"><div class="feature-icon blue">▧</div><div><div class="feature-title">Image Analysis</div><div class="feature-copy">Upload an image and ask follow-up questions.</div></div><span class="feature-arrow">↗</span></div>
-</div>
-""", unsafe_allow_html=True)
+_show_welcome = not st.session_state.messages and not st.session_state.get("pending_prompt")
+if _show_welcome:
+    st.markdown(
+        """
+        <section class="hc-welcome">
+          <div class="hc-badge">✚</div>
+          <h1>How can I help with your health today?</h1>
+          <p>Ask in plain language. Add your own medical PDFs and every answer shows the file and page it came from.</p>
+          <div class="hc-trust">
+            <span><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>Cites PDF pages</span>
+            <span><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>Never diagnoses</span>
+            <span><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>Chats stay on your server</span>
+          </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(key="chips"):
+        _chip_cols = st.columns(2)
+        _chips = [
+            "What are common symptoms of diabetes?",
+            "How is high blood pressure managed?",
+            "Explain a blood test report in simple words",
+            "When should I see a doctor for a fever?",
+        ]
+        for _i, _text in enumerate(_chips):
+            with _chip_cols[_i % 2]:
+                if st.button(_text, key=f"chip_{_i}", use_container_width=True):
+                    st.session_state.pending_prompt = _text
+                    st.rerun()
 
 
 # =========================================================
@@ -453,6 +591,7 @@ def clear_conversation():
     st.session_state.image_filename = None
     st.session_state.analyzed_image_id = None
     st.session_state.last_rag_warning = None
+    st.session_state.editing_index = None
     st.session_state.conversation_selector = new_id
 
 
@@ -534,16 +673,13 @@ with st.sidebar:
             else:
                 st.info("No medical PDFs saved yet. Upload a PDF above to create your knowledge base.")
 
-            rebuild_col, info_col = st.columns([1, 2])
-            with rebuild_col:
-                rebuild_clicked = st.button(
-                    "🔄 Rebuild knowledge base",
-                    key="rebuild_medical_index",
-                    use_container_width=True,
-                    disabled=not bool(existing_pdfs),
-                )
-            with info_col:
-                st.caption("Indexing uses your configured Google embedding API. This may take time and incur API usage.")
+            rebuild_clicked = st.button(
+                "🔄 Rebuild knowledge base",
+                key="rebuild_medical_index",
+                use_container_width=True,
+                disabled=not bool(existing_pdfs),
+            )
+            st.caption("Run this after saving PDFs. Indexing uses your Google embedding API and may take a minute.")
 
             if rebuild_clicked:
                 try:
@@ -554,7 +690,6 @@ with st.sidebar:
                     st.error("Knowledge base rebuild failed. Check the PDF text and your embedding configuration.")
                     st.code(f"{type(exc).__name__}: {exc}")
 
-    st.divider()
 
 
     # Image analysis is highlighted in the sidebar, but the actual attachment is made in chat.
@@ -562,14 +697,12 @@ with st.sidebar:
         st.markdown("**Attach an image in the chat composer**")
         st.caption("Add a JPG, PNG, or WEBP image next to your message. The image and its description stay scoped to this conversation, including its saved history.")
 
-    st.divider()
 
 # =========================================================
 # 8. SIDEBAR + SAVED CHAT HISTORY
 # =========================================================
 
 with st.sidebar:
-    st.markdown("### Recent chats")
     conversations = list_conversations(limit=40)
     conversation_map = {item["id"]: item for item in conversations}
     options = [item["id"] for item in conversations]
@@ -581,24 +714,50 @@ with st.sidebar:
             "updated_at": local_now_iso(),
         }
 
-    st.markdown("### Your chats")
-    st.caption("Recent conversations")
-    for chat_id in options[:18]:
+    st.markdown("### Recent chats")
+    for chat_id in options[:30]:
         item = conversation_map.get(chat_id, {})
-        title = (item.get("title") or "New conversation").strip()
-        title = title if len(title) <= 32 else title[:29] + "…"
+        full_title = (item.get("title") or "New conversation").strip()
         is_active = chat_id == st.session_state.conversation_id
-        label = ("●  " if is_active else "   ") + title
-        if st.button(label, key=f"history_chat_{chat_id}", use_container_width=True, type="secondary"):
-            if chat_id != st.session_state.conversation_id:
-                selected = get_conversation(chat_id) or {}
-                st.session_state.conversation_id = chat_id
-                st.session_state.messages = load_conversation_messages(chat_id)
-                st.session_state.image_context = selected.get("image_context")
-                st.session_state.image_filename = selected.get("image_filename")
-                st.session_state.analyzed_image_id = None
-                st.session_state.last_rag_warning = None
-                st.rerun()
+        is_pinned = bool(item.get("pinned"))
+        label = ("📌 " if is_pinned else "") + full_title
+
+        with st.container(key=f"chatrow_{'on' if is_active else 'off'}_{chat_id}"):
+            title_col, menu_col = st.columns([5, 1], vertical_alignment="center", gap="small")
+            with title_col:
+                if st.button(label, key=f"history_chat_{chat_id}", use_container_width=True, type="secondary"):
+                    if not is_active:
+                        open_chat(chat_id)
+                        st.rerun()
+            with menu_col:
+                with st.popover("•••", use_container_width=True):
+                    if st.button("Unpin" if is_pinned else "Pin", key=f"pin_{chat_id}", icon=":material/keep_off:" if is_pinned else ":material/keep:", use_container_width=True):
+                        set_chat_flag(chat_id, "pinned", not is_pinned)
+                        st.rerun()
+                    if st.button("Rename", key=f"rename_{chat_id}", icon=":material/edit:", use_container_width=True):
+                        rename_dialog(chat_id, full_title)
+                    if st.button("Archive", key=f"archive_{chat_id}", icon=":material/archive:", use_container_width=True):
+                        set_chat_flag(chat_id, "archived", True)
+                        leave_chat_if_active(chat_id)
+                        st.rerun()
+                    if st.button("Delete", key=f"del_{chat_id}", icon=":material/delete:", use_container_width=True):
+                        delete_dialog(chat_id, full_title)
+
+    archived_chats = list_archived_conversations()
+    if archived_chats:
+        with st.expander(f"Archived chats ({len(archived_chats)})", expanded=False):
+            for archived_item in archived_chats:
+                archived_title = (archived_item.get("title") or "New conversation").strip()
+                st.caption(archived_title if len(archived_title) <= 40 else archived_title[:37] + "…")
+                restore_col, remove_col = st.columns(2)
+                with restore_col:
+                    if st.button("Restore", key=f"restore_{archived_item['id']}", use_container_width=True):
+                        set_chat_flag(archived_item["id"], "archived", False)
+                        st.rerun()
+                with remove_col:
+                    if st.button("Delete", key=f"del_arch_{archived_item['id']}", use_container_width=True):
+                        delete_dialog(archived_item["id"], archived_title)
+
     st.caption("History is stored locally on this server.")
 
     export_markdown = ["# HealthCare AI conversation", ""]
@@ -667,6 +826,7 @@ def get_relevant_medical_context(question):
         retrieved = retrieve_medical_context(
             question.strip(),
             k=RAG_TOP_K,
+            score_threshold=RAG_SCORE_THRESHOLD,
         )
 
         if not retrieved:
@@ -968,12 +1128,47 @@ def append_evidence_review(answer, question, medical_context, rag_warning=None):
 # 12. CHAT HISTORY DISPLAY
 # =========================================================
 
-st.markdown("<div class='small-label'>CHAT WORKSPACE</div>", unsafe_allow_html=True)
-st.markdown("## How can I help you today?")
-st.caption("Ask a health question or follow up on a previous response. Answers are informational, not a diagnosis.")
 
-for message in st.session_state.messages:
+def render_edit_button(index):
+    """Small Edit button under a user message (shown on hover)."""
+    with st.container(key=f"editrow_{index}"):
+        if st.button("Edit", key=f"edit_btn_{index}", icon=":material/edit:", help="Edit this message and resend"):
+            st.session_state.editing_index = index
+            st.rerun()
+
+
+def render_edit_form(index, message):
+    """Inline editor: saving removes this message and everything after it, then resends."""
+    text = str(message.get("content", ""))
+    if text.startswith("📎") and "\n\n" in text:
+        text = text.split("\n\n", 1)[1]
+    new_text = st.text_area(
+        "Edit message", value=text, key=f"edit_text_{index}",
+        label_visibility="collapsed", height=110,
+    )
+    cancel_col, send_col = st.columns(2)
+    with cancel_col:
+        if st.button("Cancel", key=f"edit_cancel_{index}", use_container_width=True):
+            st.session_state.editing_index = None
+            st.rerun()
+    with send_col:
+        if st.button("Save and send", key=f"edit_send_{index}", type="primary", use_container_width=True):
+            cleaned = (new_text or "").strip()
+            if not cleaned:
+                st.warning("Message cannot be empty.")
+            else:
+                truncate_conversation_from(st.session_state.conversation_id, index)
+                st.session_state.messages = st.session_state.messages[:index]
+                st.session_state.editing_index = None
+                st.session_state.pending_prompt = cleaned
+                st.rerun()
+
+
+for _idx, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
+        if message["role"] == "user" and st.session_state.get("editing_index") == _idx:
+            render_edit_form(_idx, message)
+            continue
         attachment_path = message.get("attachment_path")
         if attachment_path:
             saved_image = (APP_DIR / attachment_path).resolve()
@@ -982,6 +1177,8 @@ for message in st.session_state.messages:
                 st.image(str(saved_image), caption="Image attached to this conversation", width=360)
         st.markdown(message["content"])
         st.caption(format_timestamp(message.get("created_at")))
+        if message["role"] == "user":
+            render_edit_button(_idx)
 
         # Display only sources stored with this response.
         saved_sources = message.get("sources", [])
@@ -1007,18 +1204,56 @@ for message in st.session_state.messages:
 # =========================================================
 
 chat_submission = st.chat_input(
-    "Message HealthCare AI… attach an image or ask a health question",
+    "Ask a health question, or attach an image or PDF",
     accept_file="multiple",
-    file_type=["jpg", "jpeg", "png", "webp"],
+    file_type=["jpg", "jpeg", "png", "webp", "pdf"],
     key="healthcare_chat_composer",
 )
+
+class _PromptChip:
+    """Lets a suggestion chip behave like a typed chat message."""
+    def __init__(self, text):
+        self.text = text
+        self.files = []
+
+
+if not chat_submission and st.session_state.get("pending_prompt"):
+    chat_submission = _PromptChip(st.session_state.pop("pending_prompt"))
 
 if chat_submission:
     question = (getattr(chat_submission, "text", "") or "").strip()
     attached_files = list(getattr(chat_submission, "files", []) or [])
-    image_file = attached_files[0] if attached_files else None
-    if len(attached_files) > 1:
+    pdf_files = [f for f in attached_files if Path(f.name).suffix.lower() == ".pdf"]
+    image_files = [f for f in attached_files if Path(f.name).suffix.lower() != ".pdf"]
+    image_file = image_files[0] if image_files else None
+    if len(image_files) > 1:
         st.warning("Please attach one image per message for now. The first image will be used.")
+
+    # PDFs attached in the chat go into the medical library and the index is refreshed,
+    # so this and later questions can be answered from them with page citations.
+    new_pdf_names = []
+    if pdf_files:
+        for pdf in pdf_files:
+            problem = save_medical_pdf(pdf.name, pdf.getvalue())
+            if problem:
+                st.error(problem)
+            else:
+                new_pdf_names.append(Path(pdf.name).name)
+        if new_pdf_names:
+            try:
+                with st.spinner("Reading your PDF and updating the knowledge base…"):
+                    build_faiss_index()
+            except Exception as exc:
+                st.error("Your PDF was saved, but the knowledge base could not be rebuilt. Check GOOGLE_API_KEY and that the PDF has selectable text.")
+                with st.expander("Technical details", expanded=False):
+                    st.code(f"{type(exc).__name__}: {exc}")
+        if not new_pdf_names and image_file is None and not question:
+            st.stop()
+        if not question and image_file is None and new_pdf_names:
+            question = f"Please summarize {new_pdf_names[0]} and list its key points."
+    shown_question = question
+    if new_pdf_names:
+        shown_question = "📎 " + ", ".join(new_pdf_names) + "\n\n" + question
 
     attachment_path = None
     submitted_image_context = None
@@ -1082,7 +1317,7 @@ if chat_submission:
 
     user_message = {
         "role": "user",
-        "content": question,
+        "content": shown_question,
         "created_at": local_now_iso(),
         "sources": [],
         "attachment_path": attachment_path,
@@ -1093,8 +1328,9 @@ if chat_submission:
     with st.chat_message("user"):
         if attachment_path:
             st.image(str(APP_DIR / attachment_path), caption="Image attached to this conversation", width=360)
-        st.markdown(question)
+        st.markdown(shown_question)
         st.caption(format_timestamp(user_message["created_at"]))
+        render_edit_button(len(st.session_state.messages) - 1)
 
     if client is None:
         answer = (
@@ -1130,10 +1366,7 @@ if chat_submission:
         # Run retrieval for medical/document questions and whenever an image is
         # attached or the conversation already has image context, so visual
         # observations can be compared with available PDFs as well.
-        if should_show_document_status(question) or image_file is not None or active_image_context:
-            medical_context, rag_warning = get_relevant_medical_context(question)
-        else:
-            medical_context, rag_warning = [], None
+        medical_context, rag_warning = get_relevant_medical_context(question)
 
         # This is the single source of truth for both the model
         # and the source expander.

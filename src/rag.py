@@ -20,6 +20,15 @@ EMBEDDING_MODEL = os.getenv(
 )
 
 
+def fix_symbol_font_text(text):
+    """Decode PDFs (for example "Microsoft Print to PDF") that store letters as private-use
+    symbols U+F020..U+F0FF. Subtracting 0xF000 restores the real ASCII characters."""
+    return "".join(
+        chr(ord(ch) - 0xF000) if 0xF020 <= ord(ch) <= 0xF0FF else ch
+        for ch in (text or "")
+    )
+
+
 def get_embeddings():
     """Create the configured Google embedding model."""
     api_key = os.getenv("GOOGLE_API_KEY", "").strip()
@@ -57,6 +66,7 @@ def build_faiss_index():
 
         for page in pages:
             page.metadata["source"] = pdf_file.name
+            page.page_content = fix_symbol_font_text(page.page_content)
 
         documents.extend(pages)
 
